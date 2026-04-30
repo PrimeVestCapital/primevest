@@ -53,7 +53,10 @@ function decodeToken(token) {
  */
 function refreshTokenExpiry() {
   const days = parseInt(JWT_REFRESH_EXPIRES_IN) || 30;
-  return Date.now() + days * 24 * 60 * 60 * 1000;
+
+  return new Date(
+    Date.now() + days * 24 * 60 * 60 * 1000
+  ).toISOString();
 }
 
 module.exports = {
