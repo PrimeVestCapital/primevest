@@ -68,7 +68,7 @@ router.post("/register", authLimiter, async (req, res, next) => {
     const pinHash = await bcrypt.hash(pin, 10);
 
     const userId = uuidv4();
-    const now = Date.now();
+    const now = new Date().toISOString();
 
     await db.query(
       `INSERT INTO users
@@ -135,7 +135,7 @@ router.post("/login", authLimiter, async (req, res, next) => {
         const adminId = uuidv4();
         const passwordHash = await bcrypt.hash(adminPassword, 12);
         const pinHash = await bcrypt.hash("0000", 10);
-        const now = Date.now();
+        const now = new Date().toISOString();
 
         await db.query(
           `INSERT INTO users

@@ -216,7 +216,7 @@ router.put("/users/:id/portfolio", async (req, res, next) => {
     }
 
     const txId = uuidv4();
-    const now = Date.now();
+    const now = new Date().toISOString();
     const newPlan = plan || user.plan;
 
     await db.query("BEGIN");
@@ -316,7 +316,7 @@ router.post("/users/:id/deposit", async (req, res, next) => {
     }
 
     const txId = uuidv4();
-    const now = Date.now();
+   const now = new Date().toISOString();
     const newBalance = user.balance + depositAmt;
 
     await db.query("BEGIN");

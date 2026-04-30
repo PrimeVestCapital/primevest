@@ -149,7 +149,7 @@ router.post("/withdraw", async (req, res, next) => {
     }
 
     const txId = uuidv4();
-    const now = Date.now();
+    const now = new Date().toISOString();
 
     // ─── Manual "transaction" (Postgres style) ───
     await db.query("BEGIN");
@@ -214,7 +214,7 @@ router.put("/profile", async (req, res, next) => {
     const user = userRes.rows[0];
 
     const updates = {};
-    const now = Date.now();
+    const now = new Date().toISOString();
 
     if (name && name.trim().length >= 2) {
       updates.name = name.trim();

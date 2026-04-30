@@ -26,8 +26,8 @@ async function seed() {
   ]);
 
   const userId = "demo001";
-  const now = Date.now();
-  const joinDate = now - 86400000 * 45;
+  const now = new Date().toISOString();
+  const joinDate = new Date().toISOString();
 
   // ─────────────────────────────
   // Insert demo user
