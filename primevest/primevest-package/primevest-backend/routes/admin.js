@@ -64,7 +64,7 @@ async function getUserWithDetails(userId) {
 router.get("/dashboard", async (req, res, next) => {
   try {
     const users = await db.all(
-      "SELECT * FROM users WHERE role = 'user' AND is_active = 1"
+      "SELECT * FROM users WHERE role = 'user' AND is_active = true"
     );
 
     const totalAUM = users.reduce((s, u) => s + u.balance + u.profit, 0);
