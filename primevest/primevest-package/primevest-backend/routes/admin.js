@@ -316,7 +316,7 @@ router.post("/users/:id/deposit", async (req, res, next) => {
     }
 
     const txId = uuidv4();
-   const now = new Date().toISOString();
+    const now = new Date().toISOString();
     const newBalance = user.balance + depositAmt;
 
     await db.query("BEGIN");
@@ -345,6 +345,360 @@ router.post("/users/:id/deposit", async (req, res, next) => {
         2
       )} deposited to ${user.name}'s account.`,
       data: { transactionId: txId, newBalance },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── CREDIT PROFIT ───────────────────────────────────────────────────
+router.post("/users/:id/credit-profit", async (req, res, next) => {
+  try {
+    const { amount, note } = req.body;
+    const profitAmt = parseFloat(amount);
+
+    if (isNaN(profitAmt) || profitAmt <= 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid profit amount." });
+    }
+
+    const user = await db.get(
+      "SELECT * FROM users WHERE id = $1 AND role = 'user'",
+      [req.params.id]
+    );
+
+    if (!user) {
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found." });
+    }
+
+    const txId = uuidv4();
+    const now = new Date().toISOString();
+    const newProfit = user.profit + profitAmt;
+
+    await db.query("BEGIN");
+
+    try {
+      await db.query(
+        "UPDATE users SET profit = $1, updated_at = $2 WHERE id = $3",
+        [newProfit, now, user.id]
+      );
+
+      await db.query(
+        `INSERT INTO transactions (id, user_id, type, amount, status, note, created_at)
+         VALUES ($1, $2, 'profit', $3, 'confirmed', $4, $5)`,
+        [txId, user.id, profitAmt, note || "Profit credit", now]
+      );
+
+      await db.query("COMMIT");
+    } catch (err) {
+      await db.query("ROLLBACK");
+      throw err;
+    }
+
+    return res.json({
+      success: true,
+      message: `$${profitAmt.toFixed(2)} profit credited to ${user.name}.`,
+      data: { transactionId: txId, newProfit },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── NOTIFY ──────────────────────────────────────────────────────────
+router.post("/notify", async (req, res, next) => {
+  try {
+    const { userId, subject, body } = req.body;
+
+    if (!subject || !body) {
+      return res.status(400).json({
+        success: false,
+        message: "Subject and body required.",
+      });
+    }
+
+    if (userId === "all") {
+      const users = await db.all(
+        "SELECT * FROM users WHERE role = 'user' AND is_active = true"
+      );
+
+      for (const user of users) {
+        sendEmail(user.email, { subject, text: body }).catch(() => {});
+        await db.query(
+          "INSERT INTO notifications (user_id, subject, body) VALUES ($1, $2, $3)",
+          [user.id, subject, body]
+        );
+      }
+
+      return res.json({
+        success: true,
+        message: `Notification sent to ${users.length} clients.`,
+      });
+    } else {
+      const user = await db.get("SELECT * FROM users WHERE id = $1", [userId]);
+
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found.",
+        });
+      }
+
+      sendEmail(user.email, { subject, text: body }).catch(() => {});
+      await db.query(
+        "INSERT INTO notifications (user_id, subject, body) VALUES ($1, $2, $3)",
+        [user.id, subject, body]
+      );
+
+      return res.json({
+        success: true,
+        message: `Notification sent to ${user.email}`,
+      });
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET NOTIFICATIONS ───────────────────────────────────────────────
+router.get("/notifications", async (req, res, next) => {
+  try {
+    const notifications = await db.all(
+      `SELECT n.*, u.name as user_name, u.email as user_email
+       FROM notifications n
+       JOIN users u ON n.user_id = u.id
+       ORDER BY n.sent_at DESC
+       LIMIT 50`
+    );
+
+    return res.json({
+      success: true,
+      data: notifications,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── SET USER STATUS ─────────────────────────────────────────────────
+router.put("/users/:id/status", async (req, res, next) => {
+  try {
+    const { isActive } = req.body;
+    const now = new Date().toISOString();
+
+    await db.query(
+      "UPDATE users SET is_active = $1, updated_at = $2 WHERE id = $3",
+      [!!isActive, now, req.params.id]
+    );
+
+    return res.json({
+      success: true,
+      message: `User ${isActive ? "activated" : "deactivated"}.`,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── SUPPORT MESSAGES ────────────────────────────────────────────────
+router.get("/support/messages", async (req, res, next) => {
+  try {
+    const messagesRes = await db.query(
+      `SELECT sm.id, sm.message, sm.admin_reply, sm.sender, sm.created_at,
+              u.id as user_id, u.name as user_name, u.email as user_email
+       FROM support_messages sm
+       JOIN users u ON sm.user_id = u.id
+       ORDER BY sm.created_at DESC`
+    );
+
+    return res.json({
+      success: true,
+      data: messagesRes.rows.map(m => ({
+        id: m.id,
+        userId: m.user_id,
+        userName: m.user_name,
+        userEmail: m.user_email,
+        message: m.message,
+        adminReply: m.admin_reply,
+        sender: m.sender,
+        createdAt: m.created_at
+      }))
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── REPLY TO SUPPORT MESSAGE ────────────────────────────────────────
+router.post("/support/reply", async (req, res, next) => {
+  try {
+    const { messageId, reply } = req.body;
+
+    if (!messageId || !reply || reply.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Message ID and reply required."
+      });
+    }
+
+    const now = new Date().toISOString();
+
+    // Update the support message with admin reply
+    await db.query(
+      `UPDATE support_messages 
+       SET admin_reply = $1, updated_at = $2 
+       WHERE id = $3`,
+      [reply.trim(), now, messageId]
+    );
+
+    // Get the message and user info
+    const msgRes = await db.query(
+      `SELECT sm.*, u.email, u.name 
+       FROM support_messages sm
+       JOIN users u ON sm.user_id = u.id
+       WHERE sm.id = $1`,
+      [messageId]
+    );
+
+    if (msgRes.rows.length > 0) {
+      const msg = msgRes.rows[0];
+      
+      // Send email notification to user
+      const emailSubject = "Support Team Response - PrimeVest Capital";
+      const emailBody = `
+Hello ${msg.name},
+
+Our support team has responded to your message:
+
+Your Message:
+"${msg.message}"
+
+Our Response:
+"${reply.trim()}"
+
+If you need further assistance, please reply through your dashboard.
+
+Best regards,
+PrimeVest Capital Support Team
+      `;
+
+      sendEmail(msg.email, { 
+        subject: emailSubject, 
+        text: emailBody 
+      }).catch(() => {});
+
+      // Create notification
+      await db.query(
+        "INSERT INTO notifications (user_id, subject, body) VALUES ($1, $2, $3)",
+        [msg.user_id, emailSubject, `Support replied: ${reply.trim()}`]
+      );
+    }
+
+    return res.json({
+      success: true,
+      message: "Reply sent successfully."
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── CREATE WITHDRAWAL CODE ──────────────────────────────────────────
+router.post("/users/:id/withdrawal-code", async (req, res, next) => {
+  try {
+    const { expiryDays = 30 } = req.body;
+    const userId = req.params.id;
+
+    const user = await db.get(
+      "SELECT * FROM users WHERE id = $1 AND role = 'user'",
+      [userId]
+    );
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found."
+      });
+    }
+
+    // Generate random 8-character code
+    const code = Math.random().toString(36).substring(2, 10).toUpperCase();
+    const codeId = uuidv4();
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + (expiryDays * 24 * 60 * 60 * 1000));
+
+    await db.query(
+      `INSERT INTO withdrawal_codes (id, user_id, code, expires_at, created_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [codeId, userId, code, expiresAt.toISOString(), now.toISOString()]
+    );
+
+    // Send email with code
+    const emailSubject = "Your Withdrawal Code - PrimeVest Capital";
+    const emailBody = `
+Hello ${user.name},
+
+A withdrawal code has been generated for your account.
+
+Withdrawal Code: ${code}
+Valid Until: ${expiresAt.toLocaleDateString()}
+
+Use this code when making withdrawals from your account. Keep this code secure and do not share it with anyone.
+
+Best regards,
+PrimeVest Capital Team
+    `;
+
+    sendEmail(user.email, {
+      subject: emailSubject,
+      text: emailBody
+    }).catch(() => {});
+
+    await db.query(
+      "INSERT INTO notifications (user_id, subject, body) VALUES ($1, $2, $3)",
+      [userId, emailSubject, `New withdrawal code: ${code}`]
+    );
+
+    return res.json({
+      success: true,
+      message: `Withdrawal code generated and sent to ${user.email}`,
+      data: {
+        code,
+        expiresAt: expiresAt.toISOString()
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET USER'S WITHDRAWAL CODES ─────────────────────────────────────
+router.get("/users/:id/withdrawal-codes", async (req, res, next) => {
+  try {
+    const userId = req.params.id;
+
+    const codesRes = await db.query(
+      `SELECT id, code, is_used, used_at, expires_at, created_at
+       FROM withdrawal_codes
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [userId]
+    );
+
+    return res.json({
+      success: true,
+      data: codesRes.rows.map(c => ({
+        id: c.id,
+        code: c.code,
+        isUsed: c.is_used,
+        usedAt: c.used_at,
+        expiresAt: c.expires_at,
+        createdAt: c.created_at,
+        isValid: !c.is_used && new Date(c.expires_at) > new Date()
+      }))
     });
   } catch (err) {
     next(err);
