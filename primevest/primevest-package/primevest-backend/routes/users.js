@@ -1,155 +1,99 @@
-// routes/admin.js – Admin-only endpoints (Postgres version)
+// routes/users.js – User profile, transactions, withdrawal, support
 "use strict";
 
 const express = require("express");
 const router = express.Router();
+const bcrypt = require("bcryptjs");
 const { v4: uuidv4 } = require("uuid");
 
 const db = require("../db/database");
-const { requireAuth, requireAdmin } = require("../middleware/auth");
+const { requireAuth } = require("../middleware/auth");
 const { sendEmail, templates } = require("../utils/email");
 
-// All admin routes require auth + admin role
-router.use(requireAuth, requireAdmin);
+// All user routes require authentication
+router.use(requireAuth);
 
-// ─── Helpers ─────────────────────────────────────────────────────────
-function fmt(n) {
-  return Number(n).toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
-
-// ─── USER DETAILS ────────────────────────────────────────────────────
-async function getUserWithDetails(userId) {
-  const user = await db.get(
-    "SELECT * FROM users WHERE id = $1 AND role = 'user'",
-    [userId]
-  );
-
+// ─── Helper ─────────────────────────────────────────────────────────
+async function getUserFull(userId) {
+  const userRes = await db.query("SELECT * FROM users WHERE id = $1", [userId]);
+  const user = userRes.rows[0];
   if (!user) return null;
 
-  const transactions = await db.all(
-    `SELECT id, type, amount, status, note, created_at as date
-     FROM transactions
-     WHERE user_id = $1
-     ORDER BY created_at DESC
-     LIMIT 50`,
-    [userId]
-  );
+  const txRes = await db.query(`
+    SELECT id, type, amount, status, note, created_at as date
+    FROM transactions
+    WHERE user_id = $1
+    ORDER BY created_at DESC
+  `, [userId]);
 
-  const profitHistory = await db.all(
-    `SELECT month, value
-     FROM profit_history
-     WHERE user_id = $1
-     ORDER BY month ASC`,
-    [userId]
-  );
+  const phRes = await db.query(`
+    SELECT month, value
+    FROM profit_history
+    WHERE user_id = $1
+    ORDER BY month ASC
+  `, [userId]);
 
   return {
     id: user.id,
     name: user.name,
     email: user.email,
+    role: user.role,
     plan: user.plan,
     balance: user.balance,
     profit: user.profit,
-    isActive: !!user.is_active,
     joinDate: user.join_date,
-    transactions,
-    profitHistory,
+    transactions: txRes.rows,
+    profitHistory: phRes.rows,
   };
 }
 
-// ─── DASHBOARD ───────────────────────────────────────────────────────
-router.get("/dashboard", async (req, res, next) => {
+// ─── GET /api/users/me ───────────────────────────────────────────────
+router.get("/me", async (req, res, next) => {
   try {
-    const users = await db.all(
-      "SELECT * FROM users WHERE role = 'user' AND is_active = true"
-    );
+    const userData = await getUserFull(req.user.id);
 
-    const totalAUM = users.reduce((s, u) => s + u.balance + u.profit, 0);
-    const totalProfit = users.reduce((s, u) => s + u.profit, 0);
-    const totalBalance = users.reduce((s, u) => s + u.balance, 0);
+    if (!userData) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
 
-    const recentTx = await db.all(
-      `SELECT t.*, u.name as user_name, u.email as user_email
-       FROM transactions t
-       JOIN users u ON t.user_id = u.id
-       ORDER BY t.created_at DESC
-       LIMIT 10`
-    );
-
-    return res.json({
-      success: true,
-      data: {
-        stats: {
-          totalClients: users.length,
-          totalAUM,
-          totalProfit,
-          totalBalance,
-        },
-        recentTransactions: recentTx.map((tx) => ({
-          id: tx.id,
-          type: tx.type,
-          amount: tx.amount,
-          status: tx.status,
-          note: tx.note,
-          date: tx.created_at,
-          userName: tx.user_name,
-          userEmail: tx.user_email,
-        })),
-      },
-    });
+    return res.json({ success: true, data: userData });
   } catch (err) {
     next(err);
   }
 });
 
-// ─── USERS LIST ──────────────────────────────────────────────────────
-router.get("/users", async (req, res, next) => {
+// ─── GET /api/users/transactions ────────────────────────────────────
+router.get("/transactions", async (req, res, next) => {
   try {
-    const { search, plan, limit = 100, offset = 0 } = req.query;
+    const { limit = 50, offset = 0, type } = req.query;
 
-    let query = "SELECT * FROM users WHERE role = 'user'";
-    const params = [];
+    let query = `
+      SELECT id, type, amount, status, note, created_at as date
+      FROM transactions
+      WHERE user_id = $1
+    `;
+    const params = [req.user.id];
 
-    if (search) {
-      query += " AND (name ILIKE $1 OR email ILIKE $2)";
-      params.push(`%${search}%`, `%${search}%`);
+    if (type && ["deposit", "withdrawal", "profit", "adjustment"].includes(type)) {
+      query += " AND type = $2";
+      params.push(type);
     }
 
-    if (plan) {
-      query += ` AND plan = $${params.length + 1}`;
-      params.push(plan);
-    }
-
-    query += ` ORDER BY join_date DESC LIMIT $${params.length + 1} OFFSET $${
-      params.length + 2
-    }`;
-
+    query += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(parseInt(limit), parseInt(offset));
 
-    const users = await db.all(query, params);
+    const result = await db.query(query, params);
 
-    const total = await db.get(
-      "SELECT COUNT(*) FROM users WHERE role = 'user'"
+    const countRes = await db.query(
+      "SELECT COUNT(*) FROM transactions WHERE user_id = $1",
+      [req.user.id]
     );
 
     return res.json({
       success: true,
-      data: users.map((u) => ({
-        id: u.id,
-        name: u.name,
-        email: u.email,
-        plan: u.plan,
-        balance: u.balance,
-        profit: u.profit,
-        portfolio: u.balance + u.profit,
-        isActive: !!u.is_active,
-        joinDate: u.join_date,
-      })),
+      data: result.rows,
       pagination: {
-        total: parseInt(total.count || total.count),
+        total: parseInt(countRes.rows[0].count),
         limit: parseInt(limit),
         offset: parseInt(offset),
       },
@@ -159,368 +103,239 @@ router.get("/users", async (req, res, next) => {
   }
 });
 
-// ─── SINGLE USER ─────────────────────────────────────────────────────
-router.get("/users/:id", async (req, res, next) => {
+// ─── POST /api/users/withdraw ────────────────────────────────────────
+router.post("/withdraw", async (req, res, next) => {
   try {
-    const userData = await getUserWithDetails(req.params.id);
+    const { amount, pin, withdrawalMethod, paymentDetails, withdrawalCode } = req.body;
 
-    if (!userData) {
-      return res
-        .status(404)
-        .json({ success: false, message: "User not found." });
+    // Validate amount
+    if (!amount || isNaN(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid amount." });
     }
 
-    return res.json({ success: true, data: userData });
-  } catch (err) {
-    next(err);
-  }
-});
+    // Validate PIN
+    if (!pin || !/^\d{4}$/.test(pin)) {
+      return res.status(400).json({ success: false, message: "Invalid PIN." });
+    }
 
-// ─── UPDATE PORTFOLIO ───────────────────────────────────────────────
-router.put("/users/:id/portfolio", async (req, res, next) => {
-  try {
-    const { balance, profit, plan } = req.body;
+    // Validate withdrawal method
+    if (!withdrawalMethod || !["bank", "crypto"].includes(withdrawalMethod)) {
+      return res.status(400).json({ success: false, message: "Invalid withdrawal method." });
+    }
 
-    const user = await db.get(
-      "SELECT * FROM users WHERE id = $1 AND role = 'user'",
-      [req.params.id]
-    );
+    // Validate payment details
+    if (withdrawalMethod === "bank") {
+      if (!paymentDetails || !paymentDetails.accountName || !paymentDetails.bankName || !paymentDetails.accountNumber) {
+        return res.status(400).json({ success: false, message: "Complete bank details required." });
+      }
+    } else if (withdrawalMethod === "crypto") {
+      if (!paymentDetails || !paymentDetails.walletAddress) {
+        return res.status(400).json({ success: false, message: "Wallet address required." });
+      }
+    }
+
+    // Validate withdrawal code
+    if (!withdrawalCode || withdrawalCode.trim().length === 0) {
+      return res.status(400).json({ success: false, message: "Withdrawal code required." });
+    }
+
+    const userRes = await db.query("SELECT * FROM users WHERE id = $1", [req.user.id]);
+    const user = userRes.rows[0];
 
     if (!user) {
-      return res
-        .status(404)
-        .json({ success: false, message: "User not found." });
+      return res.status(404).json({ success: false, message: "User not found." });
     }
 
-    const newBalance = parseFloat(balance);
-    const newProfit = parseFloat(profit);
-    const validPlans = ["Starter", "Growth", "Premium", "Platinum"];
-
-    if (isNaN(newBalance) || newBalance < 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid balance value." });
+    // Verify PIN
+    const pinValid = await bcrypt.compare(pin, user.pin_hash);
+    if (!pinValid) {
+      return res.status(400).json({ success: false, message: "Incorrect PIN.", code: "WRONG_PIN" });
     }
 
-    if (isNaN(newProfit) || newProfit < 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid profit value." });
+    // Verify withdrawal code (check against user's stored code)
+    const codeRes = await db.query(
+      "SELECT * FROM withdrawal_codes WHERE user_id = $1 AND code = $2 AND is_used = false AND expires_at > NOW()",
+      [user.id, withdrawalCode]
+    );
+
+    if (codeRes.rows.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Invalid or expired withdrawal code. Please contact support to get a valid code.", 
+        code: "INVALID_WITHDRAWAL_CODE" 
+      });
     }
 
-    if (plan && !validPlans.includes(plan)) {
+    const total = Number(user.balance) + Number(user.profit);
+
+    if (amount > total) {
       return res.status(400).json({
         success: false,
-        message: `Plan must be one of: ${validPlans.join(", ")}`,
+        message: `Insufficient funds. Available: $${total.toFixed(2)}`
       });
+    }
+
+    let newProfit = Number(user.profit);
+    let newBalance = Number(user.balance);
+
+    if (amount <= newProfit) {
+      newProfit -= amount;
+    } else {
+      const remainder = amount - newProfit;
+      newProfit = 0;
+      newBalance = Math.max(0, newBalance - remainder);
     }
 
     const txId = uuidv4();
     const now = new Date().toISOString();
-    const newPlan = plan || user.plan;
 
+    // Prepare payment details JSON
+    const paymentDetailsJson = withdrawalMethod === "bank" 
+      ? {
+          method: "bank",
+          accountName: paymentDetails.accountName,
+          bankName: paymentDetails.bankName,
+          accountNumber: paymentDetails.accountNumber
+        }
+      : {
+          method: "crypto",
+          walletAddress: paymentDetails.walletAddress,
+          network: paymentDetails.network || "ERC20"
+        };
+
+    // ─── Manual "transaction" (Postgres style) ───
     await db.query("BEGIN");
 
     try {
       await db.query(
-        `UPDATE users
-         SET balance = $1, profit = $2, plan = $3, updated_at = $4
-         WHERE id = $5`,
-        [newBalance, newProfit, newPlan, now, user.id]
+        "UPDATE users SET balance = $1, profit = $2, updated_at = $3 WHERE id = $4",
+        [newBalance, newProfit, now, user.id]
       );
 
-      if (newBalance !== user.balance) {
-        const diff = newBalance - user.balance;
-        const txType = diff >= 0 ? "deposit" : "adjustment";
-
-        await db.query(
-          `INSERT INTO transactions (id, user_id, type, amount, status, note, created_at)
-           VALUES ($1, $2, $3, $4, 'confirmed', 'Admin portfolio update', $5)`,
-          [txId, user.id, txType, Math.abs(diff), now]
-        );
-      }
-
-      const currentMonth = new Date().getMonth() + 1;
-      const currentYear = new Date().getFullYear();
-
       await db.query(
-        `INSERT INTO profit_history (user_id, month, year, value)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (user_id, month, year)
-         DO UPDATE SET value = EXCLUDED.value`,
-        [user.id, currentMonth, currentYear, newProfit]
+        `INSERT INTO transactions (id, user_id, type, amount, status, note, payment_details, created_at)
+         VALUES ($1, $2, 'withdrawal', $3, 'confirmed', $4, $5, $6)`,
+        [
+          txId, 
+          user.id, 
+          amount, 
+          `${withdrawalMethod === 'bank' ? 'Bank Transfer' : 'USDT ERC20'} withdrawal`, 
+          JSON.stringify(paymentDetailsJson),
+          now
+        ]
+      );
+
+      // Mark withdrawal code as used
+      await db.query(
+        "UPDATE withdrawal_codes SET is_used = true, used_at = $1 WHERE id = $2",
+        [now, codeRes.rows[0].id]
       );
 
       await db.query("COMMIT");
-    } catch (err) {
+    } catch (e) {
       await db.query("ROLLBACK");
-      throw err;
+      throw e;
     }
 
-    const updatedUser = await db.get(
-      "SELECT * FROM users WHERE id = $1",
-      [user.id]
-    );
+    const updatedRes = await db.query("SELECT * FROM users WHERE id = $1", [user.id]);
+    const updatedUser = updatedRes.rows[0];
 
-    const { subject, html, text } = templates.portfolioUpdateEmail(
-      updatedUser,
-      {
-        balance: newBalance,
-        profit: newProfit,
-        plan: newPlan,
-      }
-    );
+    const { subject } = templates.withdrawalEmail(updatedUser, amount, txId);
 
-    sendEmail(user.email, { subject, html, text }).catch(() => {});
+    sendEmail(user.email, { subject }).catch(() => {});
 
     await db.query(
       "INSERT INTO notifications (user_id, subject, body) VALUES ($1, $2, $3)",
-      [
-        user.id,
-        subject,
-        `Portfolio updated: balance=$${newBalance}, profit=$${newProfit}`,
-      ]
+      [user.id, subject, `Withdrawal of $${amount} processed via ${withdrawalMethod === 'bank' ? 'Bank Transfer' : 'USDT ERC20'}`]
     );
 
     return res.json({
       success: true,
-      message: `Portfolio updated and notification sent to ${user.email}`,
-      data: updatedUser,
+      message: `Withdrawal of $${amount.toFixed(2)} processed.`,
+      data: {
+        transaction: {
+          id: txId,
+          amount,
+          type: "withdrawal",
+          date: now,
+          status: "confirmed",
+        },
+        newBalance: updatedUser.balance,
+        newProfit: updatedUser.profit,
+      },
     });
+
   } catch (err) {
     next(err);
   }
 });
 
-// ─── DEPOSIT ────────────────────────────────────────────────────────
-router.post("/users/:id/deposit", async (req, res, next) => {
+// ─── PUT /api/users/profile ──────────────────────────────────────────
+router.put("/profile", async (req, res, next) => {
   try {
-    const { amount, note } = req.body;
-    const depositAmt = parseFloat(amount);
+    const { name, currentPassword, newPassword, newPin, currentPin } = req.body;
 
-    if (isNaN(depositAmt) || depositAmt <= 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid deposit amount." });
-    }
+    const userRes = await db.query("SELECT * FROM users WHERE id = $1", [req.user.id]);
+    const user = userRes.rows[0];
 
-    const user = await db.get(
-      "SELECT * FROM users WHERE id = $1 AND role = 'user'",
-      [req.params.id]
-    );
-
-    if (!user) {
-      return res
-        .status(404)
-        .json({ success: false, message: "User not found." });
-    }
-
-    const txId = uuidv4();
+    const updates = {};
     const now = new Date().toISOString();
-    const newBalance = user.balance + depositAmt;
 
-    await db.query("BEGIN");
-
-    try {
-      await db.query(
-        "UPDATE users SET balance = $1, updated_at = $2 WHERE id = $3",
-        [newBalance, now, user.id]
-      );
-
-      await db.query(
-        `INSERT INTO transactions (id, user_id, type, amount, status, note, created_at)
-         VALUES ($1, $2, 'deposit', $3, 'confirmed', $4, $5)`,
-        [txId, user.id, depositAmt, note || "Admin deposit", now]
-      );
-
-      await db.query("COMMIT");
-    } catch (err) {
-      await db.query("ROLLBACK");
-      throw err;
+    if (name && name.trim().length >= 2) {
+      updates.name = name.trim();
     }
 
-    return res.json({
-      success: true,
-      message: `$${depositAmt.toFixed(
-        2
-      )} deposited to ${user.name}'s account.`,
-      data: { transactionId: txId, newBalance },
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ─── CREDIT PROFIT ───────────────────────────────────────────────────
-router.post("/users/:id/credit-profit", async (req, res, next) => {
-  try {
-    const { amount, note } = req.body;
-    const profitAmt = parseFloat(amount);
-
-    if (isNaN(profitAmt) || profitAmt <= 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid profit amount." });
-    }
-
-    const user = await db.get(
-      "SELECT * FROM users WHERE id = $1 AND role = 'user'",
-      [req.params.id]
-    );
-
-    if (!user) {
-      return res
-        .status(404)
-        .json({ success: false, message: "User not found." });
-    }
-
-    const txId = uuidv4();
-    const now = new Date().toISOString();
-    const newProfit = user.profit + profitAmt;
-
-    await db.query("BEGIN");
-
-    try {
-      await db.query(
-        "UPDATE users SET profit = $1, updated_at = $2 WHERE id = $3",
-        [newProfit, now, user.id]
-      );
-
-      await db.query(
-        `INSERT INTO transactions (id, user_id, type, amount, status, note, created_at)
-         VALUES ($1, $2, 'profit', $3, 'confirmed', $4, $5)`,
-        [txId, user.id, profitAmt, note || "Profit credit", now]
-      );
-
-      await db.query("COMMIT");
-    } catch (err) {
-      await db.query("ROLLBACK");
-      throw err;
-    }
-
-    return res.json({
-      success: true,
-      message: `$${profitAmt.toFixed(2)} profit credited to ${user.name}.`,
-      data: { transactionId: txId, newProfit },
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ─── NOTIFY ──────────────────────────────────────────────────────────
-router.post("/notify", async (req, res, next) => {
-  try {
-    const { userId, subject, body } = req.body;
-
-    if (!subject || !body) {
-      return res.status(400).json({
-        success: false,
-        message: "Subject and body required.",
-      });
-    }
-
-    if (userId === "all") {
-      const users = await db.all(
-        "SELECT * FROM users WHERE role = 'user' AND is_active = true"
-      );
-
-      for (const user of users) {
-        sendEmail(user.email, { subject, text: body }).catch(() => {});
-        await db.query(
-          "INSERT INTO notifications (user_id, subject, body) VALUES ($1, $2, $3)",
-          [user.id, subject, body]
-        );
+    if (newPassword) {
+      const valid = await bcrypt.compare(currentPassword, user.password_hash);
+      if (!valid) {
+        return res.status(400).json({ success: false, message: "Wrong password." });
       }
-
-      return res.json({
-        success: true,
-        message: `Notification sent to ${users.length} clients.`,
-      });
-    } else {
-      const user = await db.get("SELECT * FROM users WHERE id = $1", [userId]);
-
-      if (!user) {
-        return res.status(404).json({
-          success: false,
-          message: "User not found.",
-        });
-      }
-
-      sendEmail(user.email, { subject, text: body }).catch(() => {});
-      await db.query(
-        "INSERT INTO notifications (user_id, subject, body) VALUES ($1, $2, $3)",
-        [user.id, subject, body]
-      );
-
-      return res.json({
-        success: true,
-        message: `Notification sent to ${user.email}`,
-      });
+      updates.password_hash = await bcrypt.hash(newPassword, 12);
     }
-  } catch (err) {
-    next(err);
-  }
-});
 
-// ─── GET NOTIFICATIONS ───────────────────────────────────────────────
-router.get("/notifications", async (req, res, next) => {
-  try {
-    const notifications = await db.all(
-      `SELECT n.*, u.name as user_name, u.email as user_email
-       FROM notifications n
-       JOIN users u ON n.user_id = u.id
-       ORDER BY n.sent_at DESC
-       LIMIT 50`
-    );
+    if (newPin) {
+      const pinValid = await bcrypt.compare(currentPin, user.pin_hash);
+      if (!pinValid) {
+        return res.status(400).json({ success: false, message: "Wrong PIN." });
+      }
+      updates.pin_hash = await bcrypt.hash(newPin, 10);
+    }
 
-    return res.json({
-      success: true,
-      data: notifications,
-    });
-  } catch (err) {
-    next(err);
-  }
-});
+    const keys = Object.keys(updates);
+    if (!keys.length) {
+      return res.status(400).json({ success: false, message: "No updates." });
+    }
 
-// ─── SET USER STATUS ─────────────────────────────────────────────────
-router.put("/users/:id/status", async (req, res, next) => {
-  try {
-    const { isActive } = req.body;
-    const now = new Date().toISOString();
+    const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
+    const values = Object.values(updates);
 
     await db.query(
-      "UPDATE users SET is_active = $1, updated_at = $2 WHERE id = $3",
-      [!!isActive, now, req.params.id]
+      `UPDATE users SET ${setClause}, updated_at = $${values.length + 1} WHERE id = $${values.length + 2}`,
+      [...values, now, user.id]
     );
 
-    return res.json({
-      success: true,
-      message: `User ${isActive ? "activated" : "deactivated"}.`,
-    });
+    return res.json({ success: true, message: "Profile updated." });
+
   } catch (err) {
     next(err);
   }
 });
 
-// ─── SUPPORT MESSAGES ────────────────────────────────────────────────
+// ─── GET /api/users/support/messages ─────────────────────────────────
 router.get("/support/messages", async (req, res, next) => {
   try {
     const messagesRes = await db.query(
-      `SELECT sm.id, sm.message, sm.admin_reply, sm.sender, sm.created_at,
-              u.id as user_id, u.name as user_name, u.email as user_email
-       FROM support_messages sm
-       JOIN users u ON sm.user_id = u.id
-       ORDER BY sm.created_at DESC`
+      `SELECT id, message, admin_reply, sender, created_at
+       FROM support_messages
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [req.user.id]
     );
 
     return res.json({
       success: true,
       data: messagesRes.rows.map(m => ({
         id: m.id,
-        userId: m.user_id,
-        userName: m.user_name,
-        userEmail: m.user_email,
         message: m.message,
         adminReply: m.admin_reply,
         sender: m.sender,
@@ -532,173 +347,43 @@ router.get("/support/messages", async (req, res, next) => {
   }
 });
 
-// ─── REPLY TO SUPPORT MESSAGE ────────────────────────────────────────
-router.post("/support/reply", async (req, res, next) => {
+// ─── POST /api/users/support/send ────────────────────────────────────
+router.post("/support/send", async (req, res, next) => {
   try {
-    const { messageId, reply } = req.body;
+    const { message } = req.body;
 
-    if (!messageId || !reply || reply.trim().length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Message ID and reply required."
-      });
+    if (!message || message.trim().length === 0) {
+      return res.status(400).json({ success: false, message: "Message cannot be empty." });
     }
 
+    if (message.length > 1000) {
+      return res.status(400).json({ success: false, message: "Message too long. Maximum 1000 characters." });
+    }
+
+    const msgId = uuidv4();
     const now = new Date().toISOString();
 
-    // Update the support message with admin reply
     await db.query(
-      `UPDATE support_messages 
-       SET admin_reply = $1, updated_at = $2 
-       WHERE id = $3`,
-      [reply.trim(), now, messageId]
+      `INSERT INTO support_messages (id, user_id, message, sender, created_at)
+       VALUES ($1, $2, $3, 'user', $4)`,
+      [msgId, req.user.id, message.trim(), now]
     );
 
-    // Get the message and user info
-    const msgRes = await db.query(
-      `SELECT sm.*, u.email, u.name 
-       FROM support_messages sm
-       JOIN users u ON sm.user_id = u.id
-       WHERE sm.id = $1`,
-      [messageId]
-    );
-
-    if (msgRes.rows.length > 0) {
-      const msg = msgRes.rows[0];
-      
-      // Send email notification to user
-      const emailSubject = "Support Team Response - PrimeVest Capital";
-      const emailBody = `
-Hello ${msg.name},
-
-Our support team has responded to your message:
-
-Your Message:
-"${msg.message}"
-
-Our Response:
-"${reply.trim()}"
-
-If you need further assistance, please reply through your dashboard.
-
-Best regards,
-PrimeVest Capital Support Team
-      `;
-
-      sendEmail(msg.email, { 
-        subject: emailSubject, 
-        text: emailBody 
-      }).catch(() => {});
-
-      // Create notification
-      await db.query(
-        "INSERT INTO notifications (user_id, subject, body) VALUES ($1, $2, $3)",
-        [msg.user_id, emailSubject, `Support replied: ${reply.trim()}`]
-      );
-    }
-
-    return res.json({
-      success: true,
-      message: "Reply sent successfully."
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ─── CREATE WITHDRAWAL CODE ──────────────────────────────────────────
-router.post("/users/:id/withdrawal-code", async (req, res, next) => {
-  try {
-    const { expiryDays = 30 } = req.body;
-    const userId = req.params.id;
-
-    const user = await db.get(
-      "SELECT * FROM users WHERE id = $1 AND role = 'user'",
-      [userId]
-    );
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found."
-      });
-    }
-
-    // Generate random 8-character code
-    const code = Math.random().toString(36).substring(2, 10).toUpperCase();
-    const codeId = uuidv4();
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + (expiryDays * 24 * 60 * 60 * 1000));
-
-    await db.query(
-      `INSERT INTO withdrawal_codes (id, user_id, code, expires_at, created_at)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [codeId, userId, code, expiresAt.toISOString(), now.toISOString()]
-    );
-
-    // Send email with code
-    const emailSubject = "Your Withdrawal Code - PrimeVest Capital";
-    const emailBody = `
-Hello ${user.name},
-
-A withdrawal code has been generated for your account.
-
-Withdrawal Code: ${code}
-Valid Until: ${expiresAt.toLocaleDateString()}
-
-Use this code when making withdrawals from your account. Keep this code secure and do not share it with anyone.
-
-Best regards,
-PrimeVest Capital Team
-    `;
-
-    sendEmail(user.email, {
-      subject: emailSubject,
-      text: emailBody
-    }).catch(() => {});
-
-    await db.query(
-      "INSERT INTO notifications (user_id, subject, body) VALUES ($1, $2, $3)",
-      [userId, emailSubject, `New withdrawal code: ${code}`]
+    const newMsg = await db.query(
+      "SELECT id, message, admin_reply, sender, created_at FROM support_messages WHERE id = $1",
+      [msgId]
     );
 
     return res.json({
       success: true,
-      message: `Withdrawal code generated and sent to ${user.email}`,
+      message: "Message sent to support.",
       data: {
-        code,
-        expiresAt: expiresAt.toISOString()
+        id: newMsg.rows[0].id,
+        message: newMsg.rows[0].message,
+        adminReply: newMsg.rows[0].admin_reply,
+        sender: newMsg.rows[0].sender,
+        createdAt: newMsg.rows[0].created_at
       }
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ─── GET USER'S WITHDRAWAL CODES ─────────────────────────────────────
-router.get("/users/:id/withdrawal-codes", async (req, res, next) => {
-  try {
-    const userId = req.params.id;
-
-    const codesRes = await db.query(
-      `SELECT id, code, is_used, used_at, expires_at, created_at
-       FROM withdrawal_codes
-       WHERE user_id = $1
-       ORDER BY created_at DESC`,
-      [userId]
-    );
-
-    return res.json({
-      success: true,
-      data: codesRes.rows.map(c => ({
-        id: c.id,
-        code: c.code,
-        isUsed: c.is_used,
-        usedAt: c.used_at,
-        expiresAt: c.expires_at,
-        createdAt: c.created_at,
-        isValid: !c.is_used && new Date(c.expires_at) > new Date()
-      }))
     });
   } catch (err) {
     next(err);
