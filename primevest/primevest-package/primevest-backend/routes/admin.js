@@ -546,37 +546,7 @@ router.post("/support/reply", async (req, res, next) => {
 
     const now = new Date().toISOString();
 
-    // Update the support message with admin reply
-    // fetch current replies first
-    const existing = await db.query(
-      `SELECT admin_reply FROM support_messages WHERE id = $1`,
-      [messageId]
-    );
-  
-    let replies = [];
-  
-    try {
-      replies = existing.rows[0]?.admin_reply
-        ? JSON.parse(existing.rows[0].admin_reply)
-        : [];
-    } catch (e) {
-      replies = [];
-    }
-  
-    // append new reply
-    replies.push({
-      text: reply.trim(),
-      createdAt: now
-    });
-  
-    await db.query(
-      `UPDATE support_messages 
-      SET admin_reply = $1, updated_at = $2 
-      WHERE id = $3`,
-      [JSON.stringify(replies), now, messageId]
-    );
-
-    // Get the message and user info
+    // 1. Get existing ticket
     const msgRes = await db.query(
       `SELECT sm.*, u.email, u.name 
        FROM support_messages sm
@@ -585,43 +555,72 @@ router.post("/support/reply", async (req, res, next) => {
       [messageId]
     );
 
-    if (msgRes.rows.length > 0) {
-      const msg = msgRes.rows[0];
-      
-      // Send email notification to user
-      const emailSubject = "Support Team Response - PrimeVest Capital";
-      const emailBody = `
+    if (msgRes.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Support message not found."
+      });
+    }
+
+    const msg = msgRes.rows[0];
+
+    // 2. Parse existing messages (JSON array)
+    let messages = [];
+
+    if (msg.messages) {
+      messages =
+        typeof msg.messages === "string"
+          ? JSON.parse(msg.messages)
+          : msg.messages;
+    }
+
+    // 3. Append admin reply
+    messages.push({
+      from: "admin",
+      text: reply.trim(),
+      createdAt: now
+    });
+
+    // 4. Save back to DB
+    await db.query(
+      `UPDATE support_messages 
+       SET messages = $1::jsonb,
+           updated_at = $2
+       WHERE id = $3`,
+      [JSON.stringify(messages), now, messageId]
+    );
+
+    // 5. Send email notification
+    const emailSubject = "Support Team Response - PrimeVest Capital";
+
+    const emailBody = `
 Hello ${msg.name},
 
-Our support team has responded to your message:
+Our support team has responded to your message.
 
-Your Message:
-"${msg.message}"
-
-Our Response:
+Latest Reply:
 "${reply.trim()}"
 
-If you need further assistance, please reply through your dashboard.
+Please log in to view the full conversation.
 
 Best regards,
 PrimeVest Capital Support Team
-      `;
+    `;
 
-      sendEmail(msg.email, { 
-        subject: emailSubject, 
-        text: emailBody 
-      }).catch(() => {});
+    sendEmail(msg.email, {
+      subject: emailSubject,
+      text: emailBody
+    }).catch(() => {});
 
-      // Create notification
-      await db.query(
-        "INSERT INTO notifications (user_id, subject, body) VALUES ($1, $2, $3)",
-        [msg.user_id, emailSubject, `Support replied: ${reply.trim()}`]
-      );
-    }
+    // 6. Notification
+    await db.query(
+      "INSERT INTO notifications (user_id, subject, body) VALUES ($1, $2, $3)",
+      [msg.user_id, emailSubject, reply.trim()]
+    );
 
     return res.json({
       success: true,
-      message: "Reply sent successfully."
+      message: "Reply added to conversation."
     });
   } catch (err) {
     next(err);
