@@ -547,11 +547,33 @@ router.post("/support/reply", async (req, res, next) => {
     const now = new Date().toISOString();
 
     // Update the support message with admin reply
+    // fetch current replies first
+    const existing = await db.query(
+      `SELECT admin_reply FROM support_messages WHERE id = $1`,
+      [messageId]
+    );
+  
+    let replies = [];
+  
+    try {
+      replies = existing.rows[0]?.admin_reply
+        ? JSON.parse(existing.rows[0].admin_reply)
+        : [];
+    } catch (e) {
+      replies = [];
+    }
+  
+    // append new reply
+    replies.push({
+      text: reply.trim(),
+      createdAt: now
+    });
+  
     await db.query(
       `UPDATE support_messages 
-       SET admin_reply = $1, updated_at = $2 
-       WHERE id = $3`,
-      [reply.trim(), now, messageId]
+      SET admin_reply = $1, updated_at = $2 
+      WHERE id = $3`,
+      [JSON.stringify(replies), now, messageId]
     );
 
     // Get the message and user info
