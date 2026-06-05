@@ -362,17 +362,11 @@ router.post("/support/send", async (req, res, next) => {
 
     const msgId = uuidv4();
     const now = new Date().toISOString();
-    
-    const message = {
-      sender: "user",
-      text: req.body.message,
-      createdAt: now
-    };
-    
+
     await db.query(
-      `INSERT INTO support_messages (id, user_id, messages, created_at, updated_at)
-       VALUES ($1, $2, $3::jsonb, $4, $5)`,
-      [id, userId, JSON.stringify([message]), now, now]
+      `INSERT INTO support_messages (id, user_id, message, sender, created_at)
+       VALUES ($1, $2, $3, 'user', $4)`,
+      [msgId, req.user.id, message.trim(), now]
     );
 
     const newMsg = await db.query(
