@@ -324,23 +324,36 @@ router.put("/profile", async (req, res, next) => {
 // ─── GET /api/users/support/messages ─────────────────────────────────
 router.get("/support/messages", async (req, res, next) => {
   try {
-    const messagesRes = await db.query(
-      `SELECT id, message, admin_reply, sender, created_at
+    // Fetch the single thread row for this user (one row per user)
+    const threadRes = await db.query(
+      `SELECT id, messages, created_at, updated_at
        FROM support_messages
        WHERE user_id = $1
-       ORDER BY created_at DESC`,
+       ORDER BY created_at DESC
+       LIMIT 1`,
       [req.user.id]
     );
 
+    if (threadRes.rows.length === 0) {
+      return res.json({ success: true, data: { messages: [] } });
+    }
+
+    const thread = threadRes.rows[0];
+    let messages = [];
+
+    if (thread.messages) {
+      messages = typeof thread.messages === "string"
+        ? JSON.parse(thread.messages)
+        : thread.messages;
+    }
+
     return res.json({
       success: true,
-      data: messagesRes.rows.map(m => ({
-        id: m.id,
-        message: m.message,
-        adminReply: m.admin_reply,
-        sender: m.sender,
-        createdAt: m.created_at
-      }))
+      data: {
+        threadId: thread.id,
+        messages,           // [{from: "user"|"admin", text, createdAt}]
+        updatedAt: thread.updated_at
+      }
     });
   } catch (err) {
     next(err);
@@ -360,30 +373,43 @@ router.post("/support/send", async (req, res, next) => {
       return res.status(400).json({ success: false, message: "Message too long. Maximum 1000 characters." });
     }
 
-    const msgId = uuidv4();
     const now = new Date().toISOString();
+    const newEntry = { from: "user", text: message.trim(), createdAt: now };
 
-    await db.query(
-      `INSERT INTO support_messages (id, user_id, message, sender, created_at)
-       VALUES ($1, $2, $3, 'user', $4)`,
-      [msgId, req.user.id, message.trim(), now]
+    // Upsert: one thread row per user — append to messages array
+    const existingRes = await db.query(
+      `SELECT id, messages FROM support_messages WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [req.user.id]
     );
 
-    const newMsg = await db.query(
-      "SELECT id, message, admin_reply, sender, created_at FROM support_messages WHERE id = $1",
-      [msgId]
-    );
+    let threadId;
+
+    if (existingRes.rows.length > 0) {
+      const row = existingRes.rows[0];
+      let messages = [];
+      if (row.messages) {
+        messages = typeof row.messages === "string" ? JSON.parse(row.messages) : row.messages;
+      }
+      messages.push(newEntry);
+
+      await db.query(
+        `UPDATE support_messages SET messages = $1::jsonb, updated_at = $2 WHERE id = $3`,
+        [JSON.stringify(messages), now, row.id]
+      );
+      threadId = row.id;
+    } else {
+      threadId = uuidv4();
+      await db.query(
+        `INSERT INTO support_messages (id, user_id, message, sender, messages, created_at, updated_at)
+         VALUES ($1, $2, $3, 'user', $4::jsonb, $5, $6)`,
+        [threadId, req.user.id, message.trim(), JSON.stringify([newEntry]), now, now]
+      );
+    }
 
     return res.json({
       success: true,
       message: "Message sent to support.",
-      data: {
-        id: newMsg.rows[0].id,
-        message: newMsg.rows[0].message,
-        adminReply: newMsg.rows[0].admin_reply,
-        sender: newMsg.rows[0].sender,
-        createdAt: newMsg.rows[0].created_at
-      }
+      data: newEntry
     });
   } catch (err) {
     next(err);

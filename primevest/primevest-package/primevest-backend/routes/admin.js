@@ -506,26 +506,34 @@ router.put("/users/:id/status", async (req, res, next) => {
 // ─── SUPPORT MESSAGES ────────────────────────────────────────────────
 router.get("/support/messages", async (req, res, next) => {
   try {
+    // One thread per user — get the latest row per user_id
     const messagesRes = await db.query(
-      `SELECT sm.id, sm.message, sm.admin_reply, sm.sender, sm.created_at,
+      `SELECT DISTINCT ON (sm.user_id)
+              sm.id, sm.messages, sm.created_at, sm.updated_at,
               u.id as user_id, u.name as user_name, u.email as user_email
        FROM support_messages sm
        JOIN users u ON sm.user_id = u.id
-       ORDER BY sm.created_at DESC`
+       ORDER BY sm.user_id, sm.updated_at DESC NULLS LAST`
     );
 
     return res.json({
       success: true,
-      data: messagesRes.rows.map(m => ({
-        id: m.id,
-        userId: m.user_id,
-        userName: m.user_name,
-        userEmail: m.user_email,
-        message: m.message,
-        adminReply: m.admin_reply,
-        sender: m.sender,
-        createdAt: m.created_at
-      }))
+      data: messagesRes.rows.map(m => {
+        let messages = [];
+        if (m.messages) {
+          messages = typeof m.messages === "string" ? JSON.parse(m.messages) : m.messages;
+        }
+        return {
+          id: m.id,
+          userId: m.user_id,
+          userName: m.user_name,
+          userEmail: m.user_email,
+          messages,
+          updatedAt: m.updated_at || m.created_at,
+          // last user message preview for the thread list
+          lastMessage: messages.filter(x => x.from === "user").slice(-1)[0]?.text || ""
+        };
+      })
     });
   } catch (err) {
     next(err);
@@ -546,7 +554,7 @@ router.post("/support/reply", async (req, res, next) => {
 
     const now = new Date().toISOString();
 
-    // 1. Get existing ticket
+    // 1. Get existing thread
     const msgRes = await db.query(
       `SELECT sm.*, u.email, u.name 
        FROM support_messages sm
@@ -564,35 +572,30 @@ router.post("/support/reply", async (req, res, next) => {
 
     const msg = msgRes.rows[0];
 
-    // 2. Parse existing messages (JSON array)
+    // 2. Parse existing messages array
     let messages = [];
-
     if (msg.messages) {
-      messages =
-        typeof msg.messages === "string"
-          ? JSON.parse(msg.messages)
-          : msg.messages;
+      messages = typeof msg.messages === "string"
+        ? JSON.parse(msg.messages)
+        : msg.messages;
     }
 
     // 3. Append admin reply
-    messages.push({
-      from: "admin",
-      text: reply.trim(),
-      createdAt: now
-    });
+    const newEntry = { from: "admin", text: reply.trim(), createdAt: now };
+    messages.push(newEntry);
 
     // 4. Save back to DB
     await db.query(
       `UPDATE support_messages 
        SET messages = $1::jsonb,
-           updated_at = $2
-       WHERE id = $3`,
-      [JSON.stringify(messages), now, messageId]
+           admin_reply = $2,
+           updated_at = $3
+       WHERE id = $4`,
+      [JSON.stringify(messages), reply.trim(), now, messageId]
     );
 
     // 5. Send email notification
     const emailSubject = "Support Team Response - PrimeVest Capital";
-
     const emailBody = `
 Hello ${msg.name},
 
@@ -607,12 +610,8 @@ Best regards,
 PrimeVest Capital Support Team
     `;
 
-    sendEmail(msg.email, {
-      subject: emailSubject,
-      text: emailBody
-    }).catch(() => {});
+    sendEmail(msg.email, { subject: emailSubject, text: emailBody }).catch(() => {});
 
-    // 6. Notification
     await db.query(
       "INSERT INTO notifications (user_id, subject, body) VALUES ($1, $2, $3)",
       [msg.user_id, emailSubject, reply.trim()]
@@ -620,7 +619,8 @@ PrimeVest Capital Support Team
 
     return res.json({
       success: true,
-      message: "Reply added to conversation."
+      message: "Reply added to conversation.",
+      data: newEntry
     });
   } catch (err) {
     next(err);
