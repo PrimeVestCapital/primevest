@@ -324,37 +324,27 @@ router.put("/profile", async (req, res, next) => {
 // ─── GET /api/users/support/messages ─────────────────────────────────
 router.get("/support/messages", async (req, res, next) => {
   try {
-    // Fetch the single thread row for this user (one row per user)
-    const threadRes = await db.query(
-      `SELECT id, messages, created_at, updated_at
-       FROM support_messages
+    const res2 = await db.query(
+      `SELECT id, messages FROM support_messages
        WHERE user_id = $1
-       ORDER BY created_at DESC
+       ORDER BY created_at ASC
        LIMIT 1`,
       [req.user.id]
     );
 
-    if (threadRes.rows.length === 0) {
-      return res.json({ success: true, data: { messages: [] } });
+    if (res2.rows.length === 0) {
+      return res.json({ success: true, data: [] });
     }
 
-    const thread = threadRes.rows[0];
+    const row = res2.rows[0];
     let messages = [];
-
-    if (thread.messages) {
-      messages = typeof thread.messages === "string"
-        ? JSON.parse(thread.messages)
-        : thread.messages;
+    if (row.messages) {
+      messages = typeof row.messages === "string"
+        ? JSON.parse(row.messages)
+        : row.messages;
     }
 
-    return res.json({
-      success: true,
-      data: {
-        threadId: thread.id,
-        messages,           // [{from: "user"|"admin", text, createdAt}]
-        updatedAt: thread.updated_at
-      }
-    });
+    return res.json({ success: true, data: messages });
   } catch (err) {
     next(err);
   }
@@ -376,41 +366,33 @@ router.post("/support/send", async (req, res, next) => {
     const now = new Date().toISOString();
     const newEntry = { from: "user", text: message.trim(), createdAt: now };
 
-    // Upsert: one thread row per user — append to messages array
-    const existingRes = await db.query(
-      `SELECT id, messages FROM support_messages WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    // Upsert: find existing thread row or create one
+    const existing = await db.query(
+      `SELECT id, messages FROM support_messages WHERE user_id = $1 ORDER BY created_at ASC LIMIT 1`,
       [req.user.id]
     );
 
-    let threadId;
-
-    if (existingRes.rows.length > 0) {
-      const row = existingRes.rows[0];
+    if (existing.rows.length > 0) {
+      const row = existing.rows[0];
       let messages = [];
       if (row.messages) {
         messages = typeof row.messages === "string" ? JSON.parse(row.messages) : row.messages;
       }
       messages.push(newEntry);
-
       await db.query(
         `UPDATE support_messages SET messages = $1::jsonb, updated_at = $2 WHERE id = $3`,
         [JSON.stringify(messages), now, row.id]
       );
-      threadId = row.id;
     } else {
-      threadId = uuidv4();
+      const msgId = uuidv4();
       await db.query(
         `INSERT INTO support_messages (id, user_id, message, sender, messages, created_at, updated_at)
          VALUES ($1, $2, $3, 'user', $4::jsonb, $5, $6)`,
-        [threadId, req.user.id, message.trim(), JSON.stringify([newEntry]), now, now]
+        [msgId, req.user.id, message.trim(), JSON.stringify([newEntry]), now, now]
       );
     }
 
-    return res.json({
-      success: true,
-      message: "Message sent to support.",
-      data: newEntry
-    });
+    return res.json({ success: true, data: newEntry });
   } catch (err) {
     next(err);
   }
